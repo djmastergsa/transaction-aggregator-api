@@ -226,13 +226,7 @@ mvn spring-boot:run
 # API starts on http://localhost:8080
 ```
 
-### Option 2: H2 in-memory (no PostgreSQL needed)
-
-```bash
-mvn spring-boot:run -Dspring.profiles.active=h2
-```
-
-### Option 3: Docker Compose (PostgreSQL + App)
+### Option 2: Docker Compose (PostgreSQL + App)
 
 ```bash
 docker-compose up --build
@@ -377,7 +371,7 @@ curl "http://localhost:8080/api/v1/customers/CUST001/trends/monthly" -H "Authori
 
 ## Running Tests
 
-Tests use H2 in-memory and do not require a running PostgreSQL instance.
+Tests use mocked services (`@WebMvcTest`) and pure unit tests — no database connection required.
 
 ```bash
 # Run all tests
@@ -430,8 +424,7 @@ Categorization is keyword-based (case-insensitive match on description + merchan
 | Framework | Spring Boot 3.2.3 |
 | Security | Spring Security 6 + JJWT 0.12 (JWT / HS256) |
 | ORM | Spring Data JPA / Hibernate 6 |
-| Database (default) | PostgreSQL 18 |
-| Database (test / H2 profile) | H2 in-memory |
+| Database | PostgreSQL 18 |
 | Schema Migrations | Flyway 9 |
 | Caching | Caffeine (4 caches: transactions, aggregations, categories, customers) |
 | API Docs | SpringDoc OpenAPI 2.3 (Swagger UI) |
@@ -444,13 +437,11 @@ Categorization is keyword-based (case-insensitive match on description + merchan
 
 ## Configuration
 
-### Profiles
+### Database
 
-| Profile | Database | Use case |
-|---------|----------|----------|
-| *(default)* | PostgreSQL (`localhost:5432/transactiondb`) | Local dev, production |
-| `h2` | H2 in-memory | Quick start without PostgreSQL |
-| *(test classpath)* | H2 in-memory | `mvn test` — no DB required |
+PostgreSQL is the only supported database. Ensure it is running at `localhost:5432` with database `transactiondb` before starting the application.
+
+Tests (`mvn test`) do not connect to the database — all controller tests use mocked services and unit tests have no Spring context.
 
 ### Key Properties
 
