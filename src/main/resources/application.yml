@@ -1,0 +1,66 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:transactiondb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: password
+    hikari:
+      connection-timeout: 3000      # reject connection requests after 3 seconds
+      maximum-pool-size: 10
+      minimum-idle: 2
+      idle-timeout: 300000          # release idle connections after 5 minutes
+      max-lifetime: 1200000         # replace connections after 20 minutes
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+
+server:
+  port: 8080
+  tomcat:
+    connection-timeout: 5000        # drop connections that don't send a request within 5 seconds
+    threads:
+      max: 50
+      min-spare: 5
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,caches
+  endpoint:
+    health:
+      show-details: always
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: Transaction Aggregator API
+    version: 1.0.0
+    description: Capitec Software Engineering Assessment — Option 1
+
+app:
+  data-sources:
+    sync-on-startup: true
+
+logging:
+  level:
+    com.capitec.aggregator: INFO
+    org.springframework.web: WARN
