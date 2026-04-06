@@ -2,7 +2,7 @@
 
 A production-grade Spring Boot 3.2 REST API that aggregates customer financial transaction data
 from multiple mock data sources (Bank, Credit Card, Mobile Payment), categorizes each transaction
-using a rule-based engine, and exposes an extensive analytics API.
+using a rule-based engine, and exposes an extensive analytics API secured with JWT authentication.
 
 Built as a technical assessment for **Capitec Bank**.
 
@@ -10,35 +10,74 @@ Built as a technical assessment for **Capitec Bank**.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    REST API Layer                           │
-│   TransactionController       CustomerController            │
-│   /api/v1/transactions        /api/v1/customers             │
-└─────────────────┬───────────────────────┬───────────────────┘
-                  │                       │
-┌─────────────────▼───────────────────────▼───────────────────┐
-│                   Service Layer                             │
-│  TransactionAggregatorService    CustomerService            │
-│  TransactionCategorizationService (Strategy Pattern)        │
-└─────────────────┬───────────────────────┬───────────────────┘
-                  │                       │
-┌─────────────────▼───────────────────────▼───────────────────┐
-│              Data Source Adapters (Adapter Pattern)         │
-│   BankDataSourceAdapter                                     │
-│   CreditCardDataSourceAdapter                               │
-│   MobilePaymentDataSourceAdapter                            │
-└──────────────────────────────────────────────────────────────┘
-                  │
-┌─────────────────▼───────────────────────────────────────────┐
-│                 Repository Layer (Spring Data JPA)          │
-│  TransactionRepository    CustomerRepository                │
-│  TransactionSpecification (dynamic filtering)               │
-└─────────────────────────────────────────────────────────────┘
-                  │
-┌─────────────────▼───────────────────────────────────────────┐
-│          Database: H2 (dev) / PostgreSQL (prod)             │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    Client([Client])
+
+    subgraph Security["Security Layer"]
+        JWTFilter["JwtAuthenticationFilter\n(OncePerRequestFilter)"]
+    end
+
+    subgraph API["REST API Layer"]
+        AuthCtrl["AuthController\nPOST /api/v1/auth/login"]
+        TxnCtrl["TransactionController\n/api/v1/transactions"]
+        CustCtrl["CustomerController\n/api/v1/customers"]
+    end
+
+    subgraph Services["Service Layer"]
+        AggrSvc["TransactionAggregatorService\n(sync · query · analytics)"]
+        CustSvc["CustomerService"]
+        CatSvc["TransactionCategorizationService\n(Strategy Pattern)"]
+        MapSvc["TransactionMappingService"]
+    end
+
+    subgraph Cache["Caffeine Cache"]
+        C1["transactions"]
+        C2["aggregations"]
+        C3["categories"]
+        C4["customers"]
+    end
+
+    subgraph Guard["Concurrency"]
+        AB["AtomicBoolean\nsyncInProgress"]
+    end
+
+    subgraph Adapters["Data Source Adapters (Adapter Pattern)"]
+        Bank["BankDataSourceAdapter"]
+        CC["CreditCardDataSourceAdapter"]
+        MP["MobilePaymentDataSourceAdapter"]
+    end
+
+    subgraph Persistence["Persistence"]
+        Repo["TransactionRepository\nCustomerRepository\nTransactionSpecification"]
+        DB[(PostgreSQL\ntransactiondb)]
+        Flyway["Flyway\nschema migrations"]
+    end
+
+    subgraph Observability["Actuator"]
+        Health["/actuator/health"]
+        Metrics["/actuator/metrics"]
+        Caches["/actuator/caches"]
+    end
+
+    Client -->|"Bearer JWT"| JWTFilter
+    JWTFilter --> AuthCtrl
+    JWTFilter --> TxnCtrl
+    JWTFilter --> CustCtrl
+
+    TxnCtrl --> AggrSvc
+    CustCtrl --> CustSvc
+    AggrSvc --> CatSvc
+    AggrSvc --> MapSvc
+    CustSvc --> AggrSvc
+
+    AggrSvc <--> Cache
+    AggrSvc --> AB
+    AggrSvc --> Adapters
+    AggrSvc --> Repo
+
+    Repo --> DB
+    Flyway -.->|"V1 migration"| DB
 ```
 
 ### Design Patterns
@@ -48,12 +87,119 @@ Built as a technical assessment for **Capitec Bank**.
   source's specific format into a unified `RawTransaction` model.
 
 - **Strategy Pattern**: `TransactionCategorizationService` encapsulates keyword-based categorization
-  rules. The implementation (`TransactionCategorizationServiceImpl`) can be swapped without
-  changing callers, enabling alternative categorization strategies (e.g. ML-based).
+  rules. The implementation can be swapped without changing callers, enabling alternative strategies
+  (e.g. ML-based categorization).
 
 - **Repository + Specification Pattern**: `TransactionSpecification` builds dynamic JPA Criteria
   predicates from a `TransactionFilterRequest`, enabling type-safe dynamic queries without
   string concatenation.
+
+---
+
+## Sequence Diagrams
+
+### 1. Authentication Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AC as AuthController
+    participant AM as AuthenticationManager
+    participant UDS as UserDetailsService
+    participant JWT as JwtTokenProvider
+
+    C->>AC: POST /api/v1/auth/login {username, password}
+    AC->>AM: authenticate(credentials)
+    AM->>UDS: loadUserByUsername(username)
+    UDS-->>AM: UserDetails
+    AM-->>AC: Authentication (success)
+    AC->>JWT: generateToken(userDetails)
+    JWT-->>AC: signed JWT (HS256, 24h)
+    AC-->>C: 200 {token, type:"Bearer", username, roles, expiresIn}
+
+    Note over C,AC: On failure → AuthenticationException → 401 Unauthorized
+```
+
+### 2. Authenticated Request Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant F as JwtAuthFilter
+    participant Ctrl as Controller
+    participant Svc as Service
+    participant Ca as Caffeine Cache
+    participant Repo as Repository
+    participant DB as PostgreSQL
+
+    C->>F: GET /api/v1/transactions (Authorization: Bearer <token>)
+    F->>F: Extract & validate JWT signature + expiry
+    F->>F: Set Authentication in SecurityContext
+    F->>Ctrl: Forward (authenticated)
+    Ctrl->>Svc: getTransactions(filter)
+    Svc->>Ca: Check cache key
+    alt Cache hit
+        Ca-->>Svc: Cached PagedResponse
+    else Cache miss
+        Svc->>Repo: findAll(spec, pageable)
+        Repo->>DB: SELECT with dynamic WHERE clause
+        DB-->>Repo: ResultSet
+        Repo-->>Svc: Page<Transaction>
+        Svc->>Ca: Store result
+    end
+    Svc-->>Ctrl: PagedResponse<TransactionDto>
+    Ctrl-->>C: 200 OK
+
+    Note over C,F: No/invalid token → 401 Unauthorized
+    Note over C,F: USER role on /sync → 403 Forbidden
+```
+
+### 3. Data Sync Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client (ADMIN)
+    participant F as JwtAuthFilter
+    participant TC as TransactionController
+    participant TAS as TransactionAggregatorService
+    participant G as AtomicBoolean Guard
+    participant B as BankAdapter
+    participant CC as CreditCardAdapter
+    participant MP as MobilePaymentAdapter
+    participant Repo as Repository
+    participant Ca as Caffeine Cache
+
+    C->>F: POST /api/v1/transactions/sync (Bearer token)
+    F->>F: Validate JWT, assert ROLE_ADMIN
+    F->>TC: Forward
+    TC->>TAS: syncAllSources()
+    TAS->>G: compareAndSet(false → true)
+
+    alt Already syncing
+        G-->>TAS: false (already true)
+        TAS-->>TC: throw SyncInProgressException
+        TC-->>C: 409 Conflict
+    else Lock acquired
+        G-->>TAS: true
+        par Fetch in parallel
+            TAS->>B: fetchTransactions()
+            B-->>TAS: 250 RawTransactions
+        and
+            TAS->>CC: fetchTransactions()
+            CC-->>TAS: 150 RawTransactions
+        and
+            TAS->>MP: fetchTransactions()
+            MP-->>TAS: 100 RawTransactions
+        end
+        TAS->>Repo: findExistingRefs()
+        TAS->>TAS: Filter out duplicates
+        TAS->>Repo: saveAll(newTransactions)
+        TAS->>Ca: evictAll (transactions, aggregations, categories)
+        TAS->>G: set(false) — release lock
+        TAS-->>TC: 500 new records
+        TC-->>C: 200 {status:"success", newTransactionsPersisted:500}
+    end
+```
 
 ---
 
@@ -63,49 +209,82 @@ Built as a technical assessment for **Capitec Bank**.
 |------|---------|
 | Java | 21+ |
 | Maven | 3.9+ |
-| Docker | 24+ (optional) |
+| PostgreSQL | 15+ |
+| Docker | 24+ (optional, alternative to local PostgreSQL) |
 
 ---
 
 ## Running the Application
 
-### Option 1: Maven (Development)
+### Option 1: PostgreSQL + Maven (default)
 
 ```bash
-# Clone or navigate to the project
-cd transaction-aggregator-api
+# Ensure PostgreSQL is running with database 'transactiondb'
+# Connection: localhost:5432, user: postgres, password: postgres
 
-# Build and run (H2 in-memory database)
 mvn spring-boot:run
-
-# The API will start on http://localhost:8080
+# API starts on http://localhost:8080
 ```
 
-### Option 2: JAR (Production-like)
+### Option 2: H2 in-memory (no PostgreSQL needed)
 
 ```bash
-# Build the JAR
-mvn clean package -DskipTests
-
-# Run the JAR
-java -jar target/transaction-aggregator-api-1.0.0.jar
-
-# Run with PostgreSQL profile
-java -jar target/transaction-aggregator-api-1.0.0.jar --spring.profiles.active=postgres
+mvn spring-boot:run -Dspring.profiles.active=h2
 ```
 
-### Option 3: Docker
+### Option 3: Docker Compose (PostgreSQL + App)
 
 ```bash
-# Build the Docker image
-docker build -t transaction-aggregator-api:1.0.0 .
-
-# Run the container
-docker run -p 8080:8080 --name transaction-api transaction-aggregator-api:1.0.0
-
-# Using docker-compose
 docker-compose up --build
+# Starts PostgreSQL and the API together
 ```
+
+### Option 4: JAR
+
+```bash
+mvn clean package -DskipTests
+java -jar target/transaction-aggregator-api-1.0.0.jar
+```
+
+---
+
+## Authentication
+
+All API endpoints (except `/api/v1/auth/login`, `/swagger-ui/**`, `/api-docs/**`, `/actuator/health`) require a valid JWT token.
+
+### Step 1 — Obtain a token
+
+```bash
+curl -X POST "http://localhost:8080/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"user","password":"user123"}'
+```
+
+Response:
+```json
+{
+  "token": "eyJhbGci...",
+  "type": "Bearer",
+  "username": "user",
+  "roles": ["ROLE_USER"],
+  "expiresIn": 86400000
+}
+```
+
+### Step 2 — Use the token
+
+```bash
+TOKEN="eyJhbGci..."
+curl "http://localhost:8080/api/v1/transactions" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Credentials
+
+| Username | Password | Role | Access |
+|----------|----------|------|--------|
+| `admin` | `admin123` | ADMIN | Full access including sync |
+| `user` | `user123` | USER | Read-only (no sync) |
 
 ---
 
@@ -113,11 +292,8 @@ docker-compose up --build
 
 After starting the application:
 
-- **Swagger UI**: http://localhost:8080/swagger-ui.html
+- **Swagger UI**: http://localhost:8080/swagger-ui.html — click **Authorize** to paste a JWT token
 - **OpenAPI JSON**: http://localhost:8080/api-docs
-- **H2 Console** (dev only): http://localhost:8080/h2-console
-  - JDBC URL: `jdbc:h2:mem:transactiondb`
-  - Username: `sa` | Password: `password`
 
 ---
 
@@ -137,84 +313,71 @@ On startup, the `DataSourceInitializer` seeds 5 customers and triggers a full da
 
 ## API Reference
 
+All examples below assume `TOKEN` is set to a valid JWT (see Authentication above).
+
+### Authentication
+
+```bash
+# Login (public — no token required)
+curl -X POST "http://localhost:8080/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"user","password":"user123"}'
+```
+
 ### Transaction Endpoints (`/api/v1/transactions`)
 
-#### List Transactions with Filters
 ```bash
-# All transactions (paginated)
-curl "http://localhost:8080/api/v1/transactions"
+# List all transactions (paginated)
+curl "http://localhost:8080/api/v1/transactions" -H "Authorization: Bearer $TOKEN"
 
 # Filter by customer and category
-curl "http://localhost:8080/api/v1/transactions?customerId=CUST001&category=GROCERIES"
+curl "http://localhost:8080/api/v1/transactions?customerId=CUST001&category=GROCERIES" \
+  -H "Authorization: Bearer $TOKEN"
 
-# Filter by date range and source
-curl "http://localhost:8080/api/v1/transactions?sourceSystem=BANK&dateFrom=2024-01-01T00:00:00&dateTo=2024-06-30T23:59:59"
+# Filter by date range
+curl "http://localhost:8080/api/v1/transactions?dateFrom=2024-01-01T00:00:00&dateTo=2024-06-30T23:59:59" \
+  -H "Authorization: Bearer $TOKEN"
 
-# Filter by amount range with custom sorting
-curl "http://localhost:8080/api/v1/transactions?minAmount=1000&maxAmount=50000&sortBy=amount&sortDirection=DESC"
+# Get by UUID
+curl "http://localhost:8080/api/v1/transactions/{uuid}" -H "Authorization: Bearer $TOKEN"
 
-# Custom pagination
-curl "http://localhost:8080/api/v1/transactions?page=0&size=50"
-```
+# Get by reference
+curl "http://localhost:8080/api/v1/transactions/ref/BANK-CUST001-SAL-001" \
+  -H "Authorization: Bearer $TOKEN"
 
-#### Get Single Transaction
-```bash
-# By UUID
-curl "http://localhost:8080/api/v1/transactions/{uuid}"
+# Sync (ADMIN only)
+curl -X POST "http://localhost:8080/api/v1/transactions/sync" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 
-# By reference
-curl "http://localhost:8080/api/v1/transactions/ref/BANK-CUST001-SAL-001"
-```
-
-#### Sync Data Sources
-```bash
-curl -X POST "http://localhost:8080/api/v1/transactions/sync"
-```
-
-#### Aggregation Analytics
-```bash
-# Overall summary
-curl "http://localhost:8080/api/v1/transactions/aggregate"
-
-# Summary filtered to one customer
-curl "http://localhost:8080/api/v1/transactions/aggregate?customerId=CUST001"
+# Aggregation summary
+curl "http://localhost:8080/api/v1/transactions/aggregate" -H "Authorization: Bearer $TOKEN"
 
 # Category breakdown
-curl "http://localhost:8080/api/v1/transactions/categories/summary"
+curl "http://localhost:8080/api/v1/transactions/categories/summary" -H "Authorization: Bearer $TOKEN"
 
 # Monthly trends (last 12 months)
-curl "http://localhost:8080/api/v1/transactions/trends/monthly"
+curl "http://localhost:8080/api/v1/transactions/trends/monthly" -H "Authorization: Bearer $TOKEN"
 
 # Per-source summary
-curl "http://localhost:8080/api/v1/transactions/sources/summary"
+curl "http://localhost:8080/api/v1/transactions/sources/summary" -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Customer Endpoints (`/api/v1/customers`)
 
 ```bash
-# List all customers
-curl "http://localhost:8080/api/v1/customers"
-
-# Get specific customer
-curl "http://localhost:8080/api/v1/customers/CUST001"
-
-# Get customer transactions (paginated + filtered)
-curl "http://localhost:8080/api/v1/customers/CUST001/transactions"
-curl "http://localhost:8080/api/v1/customers/CUST001/transactions?category=DINING&page=0&size=10"
-
-# Customer financial summary
-curl "http://localhost:8080/api/v1/customers/CUST001/summary"
-
-# Customer category breakdown
-curl "http://localhost:8080/api/v1/customers/CUST001/categories/summary"
-
-# Customer monthly trends
-curl "http://localhost:8080/api/v1/customers/CUST001/trends/monthly"
+curl "http://localhost:8080/api/v1/customers" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8080/api/v1/customers/CUST001" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8080/api/v1/customers/CUST001/transactions" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8080/api/v1/customers/CUST001/summary" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8080/api/v1/customers/CUST001/categories/summary" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8080/api/v1/customers/CUST001/trends/monthly" -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
 
 ## Running Tests
+
+Tests use H2 in-memory and do not require a running PostgreSQL instance.
 
 ```bash
 # Run all tests
@@ -225,19 +388,18 @@ mvn test -Dtest=TransactionCategorizationServiceTest
 mvn test -Dtest=TransactionAggregatorServiceTest
 mvn test -Dtest=TransactionControllerTest
 mvn test -Dtest=CustomerControllerTest
-
-# Run tests with coverage report
-mvn test jacoco:report
+mvn test -Dtest=AuthControllerTest
 ```
 
 ### Test Coverage
 
 | Test Class | Tests | Description |
 |------------|-------|-------------|
-| `TransactionCategorizationServiceTest` | 30+ | Tests every category keyword, edge cases (null/empty/blank), case insensitivity |
-| `TransactionAggregatorServiceTest` | 15+ | Mocks adapters and repository; tests sync, deduplication, aggregation |
-| `TransactionControllerTest` | 20+ | `@WebMvcTest` for all transaction endpoints with valid/invalid params |
-| `CustomerControllerTest` | 20+ | `@WebMvcTest` for all customer endpoints, 404 cases, filter propagation |
+| `TransactionCategorizationServiceTest` | 54 | Every category keyword, edge cases, case insensitivity |
+| `TransactionAggregatorServiceTest` | 13 | Sync, deduplication, aggregation with mocked adapters |
+| `TransactionControllerTest` | 12 | `@WebMvcTest` — all endpoints, auth, role enforcement |
+| `CustomerControllerTest` | 30 | `@WebMvcTest` — all customer endpoints, 404 cases |
+| `AuthControllerTest` | 6 | Login success (admin/user), 401 on bad creds, 400 on blank fields |
 
 ---
 
@@ -266,29 +428,38 @@ Categorization is keyword-based (case-insensitive match on description + merchan
 |-------|-----------|
 | Language | Java 21 |
 | Framework | Spring Boot 3.2.3 |
-| ORM | Spring Data JPA / Hibernate |
-| Database (dev) | H2 in-memory |
-| Database (prod) | PostgreSQL 15 |
+| Security | Spring Security 6 + JJWT 0.12 (JWT / HS256) |
+| ORM | Spring Data JPA / Hibernate 6 |
+| Database (default) | PostgreSQL 18 |
+| Database (test / H2 profile) | H2 in-memory |
+| Schema Migrations | Flyway 9 |
+| Caching | Caffeine (4 caches: transactions, aggregations, categories, customers) |
 | API Docs | SpringDoc OpenAPI 2.3 (Swagger UI) |
-| Boilerplate | Lombok |
-| Object Mapping | MapStruct 1.5.5 |
-| Testing | JUnit 5 + Mockito + Spring Boot Test |
+| Observability | Spring Boot Actuator (health, metrics, caches) |
+| Testing | JUnit 5 + Mockito + Spring Security Test |
 | Build | Maven 3.9 |
-| Container | Docker (multi-stage build) |
+| Container | Docker + Docker Compose |
 
 ---
 
 ## Configuration
 
-### application.yml (default - H2)
-H2 in-memory database used by default for ease of development and testing.
+### Profiles
 
-### application-postgres.yml
-Switch to PostgreSQL by running with `--spring.profiles.active=postgres` and ensuring a PostgreSQL instance is available at `localhost:5432/transactiondb`.
+| Profile | Database | Use case |
+|---------|----------|----------|
+| *(default)* | PostgreSQL (`localhost:5432/transactiondb`) | Local dev, production |
+| `h2` | H2 in-memory | Quick start without PostgreSQL |
+| *(test classpath)* | H2 in-memory | `mvn test` — no DB required |
 
 ### Key Properties
+
 ```yaml
 app:
   data-sources:
-    sync-on-startup: true  # Set to false to disable auto data load
+    sync-on-startup: true   # set false to skip auto data load
+  security:
+    jwt:
+      secret: <min 32-char secret>
+      expiration: 86400000  # 24 hours in ms
 ```

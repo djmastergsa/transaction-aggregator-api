@@ -5,8 +5,11 @@ import com.capitec.aggregator.domain.dto.response.*;
 import com.capitec.aggregator.domain.enums.TransactionCategory;
 import com.capitec.aggregator.domain.enums.TransactionStatus;
 import com.capitec.aggregator.domain.enums.TransactionType;
+import com.capitec.aggregator.config.SecurityConfig;
 import com.capitec.aggregator.exception.GlobalExceptionHandler;
 import com.capitec.aggregator.exception.ResourceNotFoundException;
+import com.capitec.aggregator.security.JwtAuthenticationFilter;
+import com.capitec.aggregator.security.JwtTokenProvider;
 import com.capitec.aggregator.service.CustomerService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -16,6 +19,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
@@ -33,7 +37,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultHandlers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @WebMvcTest(CustomerController.class)
-@Import(GlobalExceptionHandler.class)
+@Import({GlobalExceptionHandler.class, SecurityConfig.class, JwtTokenProvider.class, JwtAuthenticationFilter.class})
+@WithMockUser(roles = "USER")
 @DisplayName("CustomerController Tests")
 class CustomerControllerTest {
 
